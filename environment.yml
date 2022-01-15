@@ -1,0 +1,13 @@
+name: SBB
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python>=3.8
+  - pytorch~=1.10.1
+  - pyro-ppl>=1.8.0
+  - jupyter
+  - jupyterlab
+  - pip
+  - pip:
+      - funsor~=0.4.2

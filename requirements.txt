@@ -1,0 +1,8 @@
+pip>=21.1.2
+setuptools>=57.0.0
+wheel>=0.36.2
+pyro-ppl>=1.8.0
+torch~=1.10.1
+jupyter
+jupyterlab
+funsor~=0.4.2
