@@ -7,5 +7,6 @@ jupyter
 jupyterlab
 funsor~=0.4.2
 tqdm
-matplotlib
-pandas
+matplotlib~=3.5.1
+pandas~=1.3.5
+graphviz~=0.19.1
