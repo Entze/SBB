@@ -270,8 +270,8 @@ class SSVAE(nn.Module):
             self,
             output_size=2,
             input_size=vec_len,
-            z_dim=vec_len * 3,
-            hidden_layers=(vec_len * 3,),
+            z_dim=vec_len,
+            hidden_layers=(vec_len,),
             config_enum=None,
             use_cuda=False,
             aux_loss_multiplier=None,
@@ -297,6 +297,8 @@ class SSVAE(nn.Module):
         z_dim = self.z_dim
         if isinstance(self.hidden_layers, list):
             hidden_sizes = self.hidden_layers
+        elif isinstance(self.hidden_layers, int):
+            hidden_sizes = [self.hidden_layers]
         else:
             hidden_sizes = [size for size in self.hidden_layers]
 
@@ -319,7 +321,7 @@ class SSVAE(nn.Module):
         self.encoder_z = MLP(
             [self.input_size + self.output_size] + hidden_sizes + [z_dim],
             activation=nn.Softplus,
-            output_activation=[None, Exp],
+            output_activation=nn.Softmax,
             allow_broadcast=self.allow_broadcast,
             use_cuda=self.use_cuda,
         )
@@ -404,7 +406,10 @@ class SSVAE(nn.Module):
 # %%
 # batch_size: number of images (and labels) to be considered in a batch
 ss_vae = SSVAE(
-    use_cuda=True,
+    input_size=vec_len,
+    z_dim=vec_len,
+    hidden_layers=vec_len,
+    use_cuda=False,
     config_enum="parallel",
 )
 
