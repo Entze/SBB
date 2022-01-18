@@ -3,7 +3,6 @@ from collections import namedtuple
 
 import pyro.distributions as dist
 import torch
-from pyro.infer import config_enumerate
 from pyroapi import pyro
 from torch import nn
 from tqdm import trange
@@ -17,18 +16,20 @@ class Decoder(nn.Module):
         # setup the two linear transformations used
         self.fc1 = nn.Linear(encoding_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, lexicon_len)
+        self.fc22 = nn.Linear(hidden_dim, 1)
         # setup the non-linearities
         self.softplus = nn.Softplus()
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, z):
+    def forward(self, z, y):
         # define the forward computation on the latent z
         # first compute the hidden units
         hidden = self.softplus(self.fc1(z))
         # return the parameter for the output Categorical
         # each is of size batch_size x Sentence length x Lexicon length
         sentence_logits = self.fc21(hidden)
-        return sentence_logits
+        label_probability = self.sigmoid(self.fc22(hidden))
+        return sentence_logits, label_probability
 
 
 class Encoder(nn.Module):
@@ -41,7 +42,7 @@ class Encoder(nn.Module):
         # setup the non-linearities
         self.softplus = nn.Softplus()
 
-    def forward(self, x):
+    def forward(self, x, y):
         # define the forward computation on the image x
         # first shape the mini-batch to have pixels in the rightmost dimension
         x = x.unsqueeze(-1)
@@ -71,7 +72,7 @@ class VAE(nn.Module):
         self.encoding_dim = encoding_dim
 
     # define the model p(x|z)p(z)
-    def model(self, sentences, sentence_len, obs_flag=True):
+    def model(self, sentences, labels, sentence_len, obs_flag=True):
         # register PyTorch module `decoder` with Pyro
         pyro.module("decoder", self.decoder)
         with pyro.plate("data", sentences.shape[0]):
@@ -80,19 +81,23 @@ class VAE(nn.Module):
             z_scale = torch.ones((sentences.shape[0], sentence_len, self.encoding_dim), device=sentences.device)
             # sample from prior (value will be sampled by guide when computing the ELBO)
             z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(2))
+
+            p = torch.full((sentences.shape[0],), 0.5)
+            ls = pyro.sample("obs_labels", dist.Bernoulli(p), obs=labels if obs_flag else None)
+
             # decode the latent code z
             logits_words = self.decoder(z)  # size -> (batch.size, vec_len, lex_len)
-            # score against actual images
-            return pyro.sample("obs", dist.Categorical(logits=logits_words).to_event(1),
+            sens = pyro.sample("obs_sentences", dist.Categorical(logits=logits_words).to_event(1),
                                obs=sentences if obs_flag else None)
+            return ls, sens
 
     # define the guide (i.e. variational distribution) q(z|x)
-    def guide(self, sentences, sentence_len, obs_flag=True):
+    def guide(self, sentences, labels, sentence_len, obs_flag=True):
         # register PyTorch module `encoder` with Pyro
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", sentences.shape[0]):
             # use the encoder to get the parameters used to define q(z|x)
-            z_loc, z_scale = self.encoder(sentences)
+            z_loc, z_scale = self.encoder(sentences, labels)
             # sample the latent code z
             return pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(2))
 
