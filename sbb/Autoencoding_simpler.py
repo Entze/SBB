@@ -11,26 +11,29 @@ Loader = namedtuple('Loader', ['dataset', 'labels', 'lexicon', 'sentences_len'])
 
 
 class Decoder(nn.Module):
-    def __init__(self, lexicon_len, encoding_dim, hidden_dim):
+    def __init__(self, sentence_len, lexicon_len, encoding_dim, hidden_dim):
         super().__init__()
+        self.sentence_len = sentence_len
         # setup the two linear transformations used
-        self.fc1 = nn.Linear(encoding_dim + 1, hidden_dim)
+        self.fc1 = nn.Linear(encoding_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, lexicon_len)
+        self.fc22 = nn.Linear(hidden_dim, 1)
+        self.fc31 = nn.Linear(sentence_len, 1)
+
         # setup the non-linearities
         self.softplus = nn.Softplus()
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, z, y):
-        # define the forward computation on the latent z
+    def forward(self, z):
+        # define the forward computation on the latent z (batch x sentence_length
         # first compute the hidden units
-        batch_size = z.size(0)
-        sentence_len = z.size(1)
-        z = torch.cat((y.unsqueeze(-1).unsqueeze(-1).expand(batch_size, sentence_len, 1), z), -1)
         hidden = self.softplus(self.fc1(z))
-        # return the parameter for the output Categorical
-        # each is of size batch_size x Sentence length x Lexicon length
+        # return the parameter for the output Categorical and the output Bernoulli
+        # each is of size batch_size x sentence_len x lexicon_len and batch_size x 1 respectively
         sentence_logits = self.fc21(hidden)
-        return sentence_logits
+        reduction = self.fc22(hidden).squeeze(-1)
+        label_prob = self.sigmoid(self.fc31(reduction).squeeze(-1))
+        return sentence_logits, label_prob
 
 
 class Encoder(nn.Module):
@@ -62,11 +65,11 @@ class Encoder(nn.Module):
 class VAE(nn.Module):
     # by default our latent space is 50-dimensional
     # and we use 400 hidden units
-    def __init__(self, lexicon_len, encoding_dim=50, hidden_dim=400, use_cuda=False):
+    def __init__(self, sentence_len, lexicon_len, encoding_dim=50, hidden_dim=400, use_cuda=False):
         super().__init__()
         # create the encoder and decoder networks
         self.encoder = Encoder(encoding_dim, hidden_dim)
-        self.decoder = Decoder(lexicon_len, encoding_dim, hidden_dim)
+        self.decoder = Decoder(sentence_len, lexicon_len, encoding_dim, hidden_dim)
 
         if use_cuda:
             # calling cuda() here will put all the parameters of
@@ -86,14 +89,13 @@ class VAE(nn.Module):
             # sample from prior (value will be sampled by guide when computing the ELBO)
             z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(2))
 
-            p = torch.full((sentences.shape[0],), 0.5)
-            ls = pyro.sample("obs_labels", dist.Bernoulli(p), obs=labels if obs_flag else None)
-
             # decode the latent code z
-            logits_words = self.decoder(z, ls)  # size -> (batch.size, vec_len, lex_len)
-            sens = pyro.sample("obs_sentences", dist.Categorical(logits=logits_words).to_event(1),
-                               obs=sentences if obs_flag else None)
-            return ls, sens
+            sentence_logits, label_prob = self.decoder(z)  # size -> (batch.size, vec_len, lex_len)
+            sentences = pyro.sample("obs_sentences", dist.Categorical(logits=sentence_logits).to_event(1),
+                                    obs=sentences if obs_flag else None)
+            assert labels is None or labels.size(0) == sentences.size(0)
+            labels = pyro.sample("obs_labels", dist.Bernoulli(label_prob), obs=labels if obs_flag else None)
+            return sentences, labels
 
     # define the guide (i.e. variational distribution) q(z|x)
     def guide(self, sentences, labels, sentence_len, obs_flag=True):
@@ -108,8 +110,11 @@ class VAE(nn.Module):
     def reconstruct_sentence(self, x, y):
         z_loc, z_scale = self.encoder(x, y)
         z = dist.Normal(z_loc, z_scale).sample()
-        sentence_logits = self.decoder(z, y)
-        return dist.Categorical(logits=sentence_logits).sample()
+        sentence_logits, label_prob = self.decoder(z)
+        print(sentence_logits)
+        print(label_prob)
+        words, ind = torch.topk(sentence_logits, 1, dim=-1)
+        return ind, torch.round(label_prob)
 
 
 def train(svi, sentences, labels, sentence_len, use_cuda=False):
@@ -120,7 +125,7 @@ def train(svi, sentences, labels, sentence_len, use_cuda=False):
     for sentence in sentences:
         # if on GPU put mini-batch into CUDA memory
         if use_cuda:
-            sentence = sentence.cuda()
+            sentence = sentence.use_cuda()
         # do ELBO gradient and accumulate loss
     epoch_loss += svi.step(sentences, labels, sentence_len)
 
@@ -137,7 +142,7 @@ def evaluate(svi, sentences, labels, sentence_len, use_cuda=False):
     for sentence in sentences:
         # if on GPU put mini-batch into CUDA memory
         if use_cuda:
-            sentence = sentence.cuda()
+            sentence = sentence.use_cuda()
         # do ELBO gradient and accumulate loss
     test_loss += svi.step(sentences, labels, sentence_len)
 
@@ -187,7 +192,7 @@ def main():
     lexicon_len = len(lexicon) + 1
     print(sentences, labels, lexicon, sentence_len, lexicon_len)
 
-    vae = VAE(lexicon_len)
+    vae = VAE(sentence_len, lexicon_len)
 
     adam = pyro.optim.Adam(dict(lr=1.0e-3))
     elbo = pyro.infer.Trace_ELBO()
@@ -208,7 +213,7 @@ def main():
             test_elbo.append(-total_epoch_loss_test)
             print("[epoch %03d] average test loss: %.4f" % (epoch, total_epoch_loss_test))
 
-    print(list(range(sentence_len)),
+    print(list(range(sentence_len)), 1,
           vae.reconstruct_sentence(torch.tensor([range(sentence_len)], dtype=torch.float), torch.tensor([1.])))
 
 
