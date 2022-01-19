@@ -3,6 +3,7 @@ import functools
 import math
 import random
 import string
+import time
 from collections import namedtuple, defaultdict
 from copy import deepcopy
 
@@ -279,28 +280,88 @@ def encode(sentence, lexicon, sentence_len=None, default=None):
                                                                          range(sentence_len - len(sentence))]
 
 
+def swap_elems(array1, array2, pos1=0, pos2=0):
+    array1.iloc[pos1], array2.iloc[pos2] = array2.iloc[pos2], array1.iloc[pos1]
+
+
+def balance_datasets(x1, x2, y1, y2, bias=None):
+    if bias is None:
+        bias0 = 0
+        bias1 = 0
+        for y in y1:
+            if y == 0:
+                bias0 += 1
+            else:
+                bias1 += 1
+    else:
+        bias0, bias1 = bias
+
+    searching_for = 0 if bias0 > bias1 else 1
+    idx1 = 0
+    abort = False
+
+
+    with tqdm(total=abs(bias0 - bias1), desc="Balancing dataset") as pbar:
+        while abs(bias0 - bias1) >= 2 and not abort:
+            while y1.iloc[idx1] != searching_for:
+                idx1 += 1
+                if len(y1) <= idx1:
+                    abort = True
+                    break
+            if abort:
+                break
+            bias0 -= 1 - searching_for
+            bias1 -= searching_for
+            x1.drop(index=x1.iloc[idx1], inplace=True)
+            y1.drop(index=x2.iloc[idx1], inplace=True)
+            pbar.update()
+
+    return x1, x2, y1, y2
+
+
 def prepare_dataset(path, sep=',', rename_columns=None, replace=None, data_column='sentence', label_column='label',
                     train_size=None, test_size=None, evaluate_size=None, random_state=None):
+    starttime = time.monotonic()
     learn_size = train_size + test_size if train_size is not None and test_size is not None else None
+    print("Reading dataset", end='', flush=True)
+    starttime = time.monotonic()
     data = pd.read_csv(path, sep=sep, engine='python').rename(columns=rename_columns).replace(replace)
+    print(". Done in {:.2f}s".format(time.monotonic() - starttime))
+    print("Preprocessing dataset", end='', flush=True)
+    starttime = time.monotonic()
     data[data_column] = data[data_column].apply(preprocess_pipeline)
+    print(". Done in {:.2f}s".format(time.monotonic() - starttime))
 
     data_X, data_y = data[data_column], data[label_column]
 
+    print("Building lexicon", end='')
+    starttime = time.monotonic()
     lexicon = build_lexicon(data_X, data_y)
+    print(". Done in {:.2f}s".format(time.monotonic() - starttime))
     sentence_len = max(len(sentence) for sentence in data[data_column])
+    print("Encode datapoints", end='')
+    starttime = time.monotonic()
     data[data_column] = data[data_column].apply(
         functools.partial(encode, lexicon=lexicon, sentence_len=sentence_len, default=0))
+    print(". Done in {:.2f}s".format(time.monotonic() - starttime))
 
     X_learn, X_evaluate, y_learn, y_evaluate = train_test_split(data_X, data_y, train_size=learn_size,
                                                                 test_size=evaluate_size, random_state=random_state)
+
+    #bias0 = (y_learn == 0).sum()
+    #bias1 = (y_learn == 1).sum()
+    #X_learn, X_evaluate, y_learn, y_evaluate = balance_datasets(X_learn, X_evaluate, y_learn, y_evaluate,
+    #                                                            (bias0, bias1))
+    #bias0 = (y_learn == 0).sum()
+    #bias1 = (y_learn == 1).sum()
+    #print("Remaining bias {} zeros vs. {} ones".format(bias0, bias1))
     X_train, X_test, y_train, y_test = train_test_split(X_learn, y_learn, train_size=train_size, test_size=test_size,
                                                         random_state=random_state)
 
     train_loader = Loader(torch.tensor(list(X_train.to_numpy()), dtype=torch.float),
                           torch.tensor(list(y_train.to_numpy()), dtype=torch.float))
     test_loader = Loader(torch.tensor(list(X_test.to_numpy()), dtype=torch.float),
-                         torch.tensor(list(y_train.to_numpy()), dtype=torch.float))
+                         torch.tensor(list(y_test.to_numpy()), dtype=torch.float))
     evaluate_loader = Loader(torch.tensor(list(X_evaluate.to_numpy()), dtype=torch.float),
                              torch.tensor(list(y_evaluate.to_numpy()), dtype=torch.float))
     return sentence_len, lexicon, train_loader, test_loader, evaluate_loader
@@ -314,6 +375,8 @@ def main(path, sep=None, epochs=1_000, test_frequency=10, minibatch_size=16, los
     lexicon_len = len(lexicon) + 1
     train_len = train_loader.dataset.size(0)
     test_len = test_loader.dataset.size(0)
+    evaluation_len = evaluate_loader.dataset.size(0)
+    total_len = train_len + test_len + evaluation_len
 
     vae = VAE(sentence_len, lexicon_len)
 
@@ -331,6 +394,14 @@ def main(path, sep=None, epochs=1_000, test_frequency=10, minibatch_size=16, los
     test_steps = math.ceil(epochs / test_frequency) * minibatches_test
     total_steps = train_steps + test_steps
     epoch_digits = max(1, round(math.log10(epochs)))
+
+    print(
+        "Optimizing on {} ({:.2f}%) datapoints."
+        " Testing on {} ({:.2f}%) datapoints. Evaluating on {} ({:.2f}%) datapoints.".format(
+            train_len, (100. * train_len / total_len),
+            test_len, (100. * test_len / total_len),
+            evaluation_len, (100. * evaluation_len / total_len)
+        ))
 
     with tqdm(total=total_steps, desc="  Training") as pbar:
         epoch = 0
@@ -378,12 +449,15 @@ if __name__ == '__main__':
     arg_parser.add_argument('--seperator', metavar='SEP', default=None, help='seperator of dataset')
     arg_parser.add_argument('--epochs', metavar='E', default=100, help='Number of epochs')
     arg_parser.add_argument('--cuda', action='store_true', default=False, help='Use cuda if available.')
+    arg_parser.add_argument('--loss-threshold', metavar='THRESHOLD', default=None,
+                            help='Threshold for loss. Optimization stops prematurely if this threshold is reached.')
 
     args = arg_parser.parse_args()
 
     path = args.path
     seperator = args.seperator
     epochs = int(args.epochs)
+    loss_threshold = None if args.loss_threshold is None else float(args.loss_threshold)
     use_cuda = args.cuda and torch.cuda.is_available()
 
-    main(path, sep=seperator, epochs=epochs, use_cuda=use_cuda)
+    main(path, sep=seperator, epochs=epochs, loss_threshold=loss_threshold, use_cuda=use_cuda)
