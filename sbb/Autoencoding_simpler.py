@@ -14,9 +14,8 @@ class Decoder(nn.Module):
     def __init__(self, lexicon_len, encoding_dim, hidden_dim):
         super().__init__()
         # setup the two linear transformations used
-        self.fc1 = nn.Linear(encoding_dim, hidden_dim)
+        self.fc1 = nn.Linear(encoding_dim + 1, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, lexicon_len)
-        self.fc22 = nn.Linear(hidden_dim, 1)
         # setup the non-linearities
         self.softplus = nn.Softplus()
         self.sigmoid = nn.Sigmoid()
@@ -24,19 +23,21 @@ class Decoder(nn.Module):
     def forward(self, z, y):
         # define the forward computation on the latent z
         # first compute the hidden units
+        batch_size = z.size(0)
+        sentence_len = z.size(1)
+        z = torch.cat((y.unsqueeze(-1).unsqueeze(-1).expand(batch_size, sentence_len, 1), z), -1)
         hidden = self.softplus(self.fc1(z))
         # return the parameter for the output Categorical
         # each is of size batch_size x Sentence length x Lexicon length
         sentence_logits = self.fc21(hidden)
-        label_probability = self.sigmoid(self.fc22(hidden))
-        return sentence_logits, label_probability
+        return sentence_logits
 
 
 class Encoder(nn.Module):
     def __init__(self, encoding_dim, hidden_dim):
         super().__init__()
         # setup the three linear transformations used
-        self.fc1 = nn.Linear(1, hidden_dim)
+        self.fc1 = nn.Linear(2, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, encoding_dim)
         self.fc22 = nn.Linear(hidden_dim, encoding_dim)
         # setup the non-linearities
@@ -46,6 +47,9 @@ class Encoder(nn.Module):
         # define the forward computation on the image x
         # first shape the mini-batch to have pixels in the rightmost dimension
         x = x.unsqueeze(-1)
+        batch_size = x.size(0)
+        sentence_length = x.size(1)
+        x = torch.cat((y.unsqueeze(-1).unsqueeze(-1).expand(batch_size, sentence_length, 1), x), -1)
         # then compute the hidden units
         hidden = self.softplus(self.fc1(x))
         # then return a mean vector and a (positive) square root covariance
@@ -86,7 +90,7 @@ class VAE(nn.Module):
             ls = pyro.sample("obs_labels", dist.Bernoulli(p), obs=labels if obs_flag else None)
 
             # decode the latent code z
-            logits_words = self.decoder(z)  # size -> (batch.size, vec_len, lex_len)
+            logits_words = self.decoder(z, ls)  # size -> (batch.size, vec_len, lex_len)
             sens = pyro.sample("obs_sentences", dist.Categorical(logits=logits_words).to_event(1),
                                obs=sentences if obs_flag else None)
             return ls, sens
@@ -101,10 +105,10 @@ class VAE(nn.Module):
             # sample the latent code z
             return pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(2))
 
-    def reconstruct_sentence(self, x):
-        z_loc, z_scale = self.encoder(x)
+    def reconstruct_sentence(self, x, y):
+        z_loc, z_scale = self.encoder(x, y)
         z = dist.Normal(z_loc, z_scale).sample()
-        sentence_logits = self.decoder(z)
+        sentence_logits = self.decoder(z, y)
         return dist.Categorical(logits=sentence_logits).sample()
 
 
@@ -118,7 +122,7 @@ def train(svi, sentences, labels, sentence_len, use_cuda=False):
         if use_cuda:
             sentence = sentence.cuda()
         # do ELBO gradient and accumulate loss
-    epoch_loss += svi.step(sentences, sentence_len)
+    epoch_loss += svi.step(sentences, labels, sentence_len)
 
     # return epoch loss
     normalizer_train = len(sentences)
@@ -135,7 +139,7 @@ def evaluate(svi, sentences, labels, sentence_len, use_cuda=False):
         if use_cuda:
             sentence = sentence.cuda()
         # do ELBO gradient and accumulate loss
-    test_loss += svi.step(sentences, sentence_len)
+    test_loss += svi.step(sentences, labels, sentence_len)
 
     # return epoch loss
     normalizer_test = len(sentences)
@@ -204,7 +208,8 @@ def main():
             test_elbo.append(-total_epoch_loss_test)
             print("[epoch %03d] average test loss: %.4f" % (epoch, total_epoch_loss_test))
 
-    print(list(range(sentence_len)), vae.reconstruct_sentence(torch.tensor(range(sentence_len), dtype=torch.float)))
+    print(list(range(sentence_len)),
+          vae.reconstruct_sentence(torch.tensor([range(sentence_len)], dtype=torch.float), torch.tensor([1.])))
 
 
 if __name__ == '__main__':
